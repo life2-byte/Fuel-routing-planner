@@ -1,7 +1,7 @@
 import hashlib
 import json
 from urllib.parse import urlencode
-
+import time
 import requests
 from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
@@ -36,9 +36,11 @@ def _read_params(request):
 
 
 def build_plan(start, finish):
+    t0 = time.perf_counter()
     route = get_route(start, finish)  # OSRM ko ek hi call
-    points = build_route_points(route["coordinates"], route["distance_miles"])
+    t1 = time.perf_counter()
 
+    points = build_route_points(route["coordinates"], route["distance_miles"])
     lats = [p[0] for p in points]
     lngs = [p[1] for p in points]
     margin = 0.3
@@ -51,9 +53,16 @@ def build_plan(start, finish):
             lng__lte=max(lngs) + margin,
         ).values("name", "address", "city", "state", "price", "lat", "lng")
     )
+    t2 = time.perf_counter()
 
     near = stations_along_route(points, candidates)
+    t3 = time.perf_counter()
+
     stops = plan_fuel(near, route["distance_miles"])
+    t4 = time.perf_counter()
+
+    def ms(a, b):
+        return round((b - a) * 1000, 1)
 
     fuel_stops = [
         {
@@ -81,6 +90,13 @@ def build_plan(start, finish):
         "fuel_stops": fuel_stops,
         "total_gallons": round(sum(s["gallons"] for s in stops), 2),
         "total_cost": round(sum(s["cost"] for s in stops), 2),
+        "timing_ms": {
+            "external_routing_apis": ms(t0, t1),
+            "route_points_and_db": ms(t1, t2),
+            "station_matching": ms(t2, t3),
+            "fuel_planning": ms(t3, t4),
+            "django_own_code_total": ms(t1, t4),
+        },
         "assumptions": {
             "max_range_miles": MAX_RANGE_MILES,
             "mpg": MPG,
@@ -102,12 +118,16 @@ def build_plan(start, finish):
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
 def plan_route(request):
+    started = time.perf_counter()
     start, finish = _read_params(request)
     if not start or not finish:
         return JsonResponse({"error": "start and finish are required"}, status=400)
 
+    fresh = request.GET.get("fresh") == "1"
     key = "plan:" + hashlib.md5(f"{start.lower()}|{finish.lower()}".encode()).hexdigest()
-    payload = cache.get(key)
+    payload = None if fresh else cache.get(key)
+    cached = payload is not None
+
     if payload is None:
         try:
             payload = build_plan(start, finish)
@@ -118,13 +138,18 @@ def plan_route(request):
         cache.set(key, payload, 60 * 60)
 
     payload = dict(payload)
+    payload["cached"] = cached
+    if request.GET.get("route") == "false":
+        payload.pop("route", None)
     payload["map_url"] = (
         request.build_absolute_uri(reverse("map"))
         + "?"
         + urlencode({"start": start, "finish": finish})
     )
-    return JsonResponse(payload)
 
+    response = JsonResponse(payload)
+    response["X-Response-Time-ms"] = f"{(time.perf_counter() - started) * 1000:.1f}"
+    return response
 
 MAP_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Fuel Route Planner</title>
